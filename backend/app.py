@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 import os
 import tensorflow as tf
+import tempfile
 
 app = Flask(__name__, static_folder="frontend", static_url_path="/")
 
@@ -17,7 +18,7 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 MONGO_URI = "mongodb+srv://devidekshina7:krXjjSaC8AwYYBxu@cluster0.qpkff.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 client = MongoClient(MONGO_URI)
 db = client["FaceRecognitionDB"]
-reference_collection = db["reference_images"]
+faces_collection = db["faces"]  # Use "faces" collection instead of storing locally
 
 try:
     client.admin.command("ping")  # Check MongoDB connection
@@ -25,11 +26,7 @@ try:
 except Exception as e:
     print(f"❌ Failed to connect to MongoDB Atlas: {e}")
 
-# Upload folder setup
-UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# ---------------------- Reference Image Upload ----------------------
+# ---------------------- Upload Reference Image to MongoDB ----------------------
 @app.route("/upload_reference", methods=["POST"])
 def upload_reference():
     if "file" not in request.files:
@@ -37,21 +34,20 @@ def upload_reference():
 
     file = request.files["file"]
     filename = file.filename
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
+    image_data = file.read()  # Read binary image data
 
-    print(f"📸 Reference image received: {filename}")
+    # Convert image to Base64 for storage in MongoDB
+    encoded_image = base64.b64encode(image_data).decode("utf-8")
 
-    # Convert image to Base64 and store in MongoDB
-    with open(filepath, "rb") as img_file:
-        image_data = base64.b64encode(img_file.read()).decode("utf-8")
-
-    result = reference_collection.insert_one({"name": filename, "image": image_data})
+    # Store in MongoDB
+    faces_collection.insert_one({"name": filename, "image": encoded_image})
     print(f"✅ Reference image {filename} stored in MongoDB!")
 
     return jsonify({"message": "Reference image uploaded successfully!", "filename": filename})
 
+
 # ---------------------- Camera Captured Image Upload ----------------------
+import tempfile  # Add this import
 
 @app.route("/camera_recognition", methods=["POST"])
 def camera_recognition():
@@ -60,41 +56,63 @@ def camera_recognition():
         return jsonify({"error": "No image received!"}), 400
 
     try:
-        # Ensure the Base64 string has the correct format
-        image_str = data["image"]
-        if "," in image_str:
-            image_str = image_str.split(",")[1]  # Remove "data:image/jpeg;base64," part
-
-        # Decode the Base64 string
+        # Decode Base64 string
+        image_str = data["image"].split(",")[1]  # Remove "data:image/jpeg;base64," part
         image_data = base64.b64decode(image_str)
         image_np = np.frombuffer(image_data, np.uint8)
 
-        # Check if decoding was successful
         if image_np.size == 0:
             return jsonify({"error": "Failed to decode image!"}), 400
 
-        # Convert to an OpenCV image
         image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
         if image is None:
             return jsonify({"error": "Failed to process image!"}), 400
 
-        # Convert to RGB and resize
+        # Convert to RGB format
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (160, 160))
 
-        # Save captured image
-        capture_path = os.path.join(UPLOAD_FOLDER, "captured.jpg")
-        cv2.imwrite(capture_path, image)
+        print("📸 Captured image processed.")
 
-        print("📸 Captured image saved.")
+        # Save the image as a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            temp_path = temp_file.name
+            cv2.imwrite(temp_path, image)  # Save as a file
+
+        # Perform face recognition against stored faces in MongoDB
+        best_match = None
+        reference_faces = faces_collection.find({}, {"_id": 0, "image": 1, "name": 1})
+
+        for ref_face in reference_faces:
+            ref_name = ref_face["name"]
+            ref_image_data = base64.b64decode(ref_face["image"])
+            ref_np_arr = np.frombuffer(ref_image_data, np.uint8)
+            ref_img = cv2.imdecode(ref_np_arr, cv2.IMREAD_COLOR)
+
+            # Save reference image as a temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as ref_temp_file:
+                ref_temp_path = ref_temp_file.name
+                cv2.imwrite(ref_temp_path, ref_img)
+
+            try:
+                print(f"🔍 Comparing captured image with reference: {ref_name}")
+                result = DeepFace.verify(img1_path=temp_path, img2_path=ref_temp_path, model_name="Facenet512", distance_metric="cosine", detector_backend="mtcnn")
+
+                if result["verified"]:
+                    best_match = ref_name
+                    break  # Stop after finding a match
+            except Exception as e:
+                print(f"❌ Error comparing with {ref_name}: {e}")
+
+        # Cleanup temporary files
+        os.remove(temp_path)
+        if best_match:
+            return jsonify({"message": "Match found!", "matched_with": best_match})
+        else:
+            return jsonify({"message": "No match found!"})
 
     except Exception as e:
         print(f"❌ Error processing image: {e}")
         return jsonify({"error": "Error processing image!"}), 500
-
-    # Proceed with face recognition
-    return jsonify({"message": "Image processed successfully!"})
-
 
 # ---------------------- Face Matching Endpoint ----------------------
 @app.route("/upload", methods=["POST"])
@@ -104,41 +122,28 @@ def upload_file():
 
     file = request.files["file"]
     filename = file.filename
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
+    image_data = file.read()
 
-    print(f"📸 Uploaded image received: {filename}")
+    # Convert image to Base64 and store in MongoDB
+    encoded_image = base64.b64encode(image_data).decode("utf-8")
 
-    # Fetch stored reference images from MongoDB
-    reference_faces = reference_collection.find({}, {"_id": 0, "image": 1, "name": 1})
+    # Store in MongoDB
+    faces_collection.insert_one({"name": filename, "image": encoded_image})
+    print(f"✅ Uploaded image {filename} stored in MongoDB!")
 
+    # Perform face matching
     best_match = None
+    reference_faces = faces_collection.find({}, {"_id": 0, "image": 1, "name": 1})
+
     for ref_face in reference_faces:
         ref_name = ref_face["name"]
         ref_image_data = base64.b64decode(ref_face["image"])
-
-        # Convert Base64 to NumPy array and decode
         ref_np_arr = np.frombuffer(ref_image_data, np.uint8)
         ref_img = cv2.imdecode(ref_np_arr, cv2.IMREAD_COLOR)
 
-        # Save temp reference image
-        ref_image_path = os.path.join(UPLOAD_FOLDER, ref_name)
-        cv2.imwrite(ref_image_path, ref_img)
-
-        # Face detection check before verification
-        try:
-            detected_faces = DeepFace.extract_faces(filepath, detector_backend="mtcnn")
-            if detected_faces is None:
-                print(f"❌ No face detected in uploaded image: {filename}")
-                return jsonify({"error": "No face detected in the image!"}), 400
-        except Exception as e:
-            print(f"❌ Error detecting face in {filename}: {e}")
-            return jsonify({"error": "Face detection failed!"}), 500
-
-        # Perform face verification using DeepFace
         try:
             print(f"🔍 Comparing {filename} with reference: {ref_name}")
-            result = DeepFace.verify(img1_path=filepath, img2_path=ref_image_path, model_name="Facenet512", distance_metric="cosine", detector_backend="mtcnn")
+            result = DeepFace.verify(img1_path=image_data, img2_path=ref_img, model_name="Facenet512", distance_metric="cosine", detector_backend="mtcnn")
 
             print(f"✅ Face verification result: {result}")
 
@@ -148,10 +153,7 @@ def upload_file():
         except Exception as e:
             print(f"❌ Error comparing with {ref_name}: {e}")
 
-    if best_match:
-        return jsonify({"message": "Match found!", "matched_with": best_match})
-    else:
-        return jsonify({"message": "No match found!"})
+    return jsonify({"message": "Match found!", "matched_with": best_match}) if best_match else jsonify({"message": "No match found!"})
 
 
 # ---------------------- Serve Frontend ----------------------
