@@ -21,17 +21,12 @@
                 body: formData
             })
             .then(response => response.json())
-            .then(data => {
-                displayResult(data);
-            })
+            .then(data => displayResult(data))
             .catch(error => console.error("Error:", error));
         }
 
         function startCamera() {
             let video = document.getElementById("video");
-            let canvas = document.getElementById("canvas");
-            let ctx = canvas.getContext("2d");
-
             navigator.mediaDevices.getUserMedia({ video: true })
                 .then(stream => {
                     video.srcObject = stream;
@@ -45,10 +40,13 @@
             let canvas = document.getElementById("canvas");
             let ctx = canvas.getContext("2d");
 
+            // Clear previous frame
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
             // Capture image from video
             ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
             
-            // Convert to Base64 and send to backend
+            // Convert to Base64
             let imageData = canvas.toDataURL("image/jpeg");
 
             fetch("/camera_recognition", {
@@ -57,22 +55,18 @@
                 headers: { "Content-Type": "application/json" }
             })
             .then(response => response.json())
-            .then(data => {
-                displayResult(data);
-            })
+            .then(data => displayResult(data))
             .catch(error => console.error("Error:", error));
         }
 
         function displayResult(data) {
             let resultDiv = document.getElementById("result");
             if (data.error) {
-                resultDiv.innerHTML = "<p style='color:red'>" + data.error + "</p>";
-            } else if (data.matches.length > 0) {
-                resultDiv.innerHTML = "<p>✅ Matches Found:</p><ul>" +
-                    data.matches.map(file => "<li>" + file + "</li>").join("") +
-                    "</ul>";
+                resultDiv.innerHTML = `<p style='color:red'>❌ ${data.error}</p>`;
+            } else if (data.matched_with) {
+                resultDiv.innerHTML = `<p>✅ Match Found: ${data.matched_with}</p>`;
             } else {
-                resultDiv.innerHTML = "<p>❌ No matches found.</p>";
+                resultDiv.innerHTML = "<p>❌ No match found.</p>";
             }
         }
     </script>

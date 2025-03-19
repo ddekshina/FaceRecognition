@@ -51,6 +51,50 @@ def upload_reference():
 
     return jsonify({"message": "Reference image uploaded successfully!", "filename": filename})
 
+# ---------------------- Camera Captured Image Upload ----------------------
+
+@app.route("/camera_recognition", methods=["POST"])
+def camera_recognition():
+    data = request.json
+    if "image" not in data:
+        return jsonify({"error": "No image received!"}), 400
+
+    try:
+        # Ensure the Base64 string has the correct format
+        image_str = data["image"]
+        if "," in image_str:
+            image_str = image_str.split(",")[1]  # Remove "data:image/jpeg;base64," part
+
+        # Decode the Base64 string
+        image_data = base64.b64decode(image_str)
+        image_np = np.frombuffer(image_data, np.uint8)
+
+        # Check if decoding was successful
+        if image_np.size == 0:
+            return jsonify({"error": "Failed to decode image!"}), 400
+
+        # Convert to an OpenCV image
+        image = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+        if image is None:
+            return jsonify({"error": "Failed to process image!"}), 400
+
+        # Convert to RGB and resize
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(image, (160, 160))
+
+        # Save captured image
+        capture_path = os.path.join(UPLOAD_FOLDER, "captured.jpg")
+        cv2.imwrite(capture_path, image)
+
+        print("📸 Captured image saved.")
+
+    except Exception as e:
+        print(f"❌ Error processing image: {e}")
+        return jsonify({"error": "Error processing image!"}), 500
+
+    # Proceed with face recognition
+    return jsonify({"message": "Image processed successfully!"})
+
 
 # ---------------------- Face Matching Endpoint ----------------------
 @app.route("/upload", methods=["POST"])
