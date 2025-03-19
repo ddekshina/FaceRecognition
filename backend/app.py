@@ -1,93 +1,121 @@
-
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_file
+from pymongo import MongoClient
 from deepface import DeepFace
-import os
-import pandas as pd
 import base64
 import cv2
 import numpy as np
-from werkzeug.utils import secure_filename
+import os
+import tensorflow as tf
 
-app = Flask(__name__, static_folder="../frontend", static_url_path="")
+app = Flask(__name__, static_folder="frontend", static_url_path="/")
 
-# Configure paths
+# Disable TensorFlow warnings
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+
+# MongoDB Atlas connection
+MONGO_URI = "mongodb+srv://devidekshina7:krXjjSaC8AwYYBxu@cluster0.qpkff.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+client = MongoClient(MONGO_URI)
+db = client["FaceRecognitionDB"]
+reference_collection = db["reference_images"]
+
+try:
+    client.admin.command("ping")  # Check MongoDB connection
+    print("✅ Connected to MongoDB Atlas successfully!")
+except Exception as e:
+    print(f"❌ Failed to connect to MongoDB Atlas: {e}")
+
+# Upload folder setup
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads")
-DB_PATH = os.path.join(os.getcwd(), "media", "db")
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
-
-# Ensure required folders exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(DB_PATH, exist_ok=True)
 
-# Check if a file is allowed
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+# ---------------------- Reference Image Upload ----------------------
+@app.route("/upload_reference", methods=["POST"])
+def upload_reference():
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded!"}), 400
 
-# Route to serve the frontend
-@app.route("/")
-def serve_frontend():
-    return send_from_directory("../frontend", "index.html")
+    file = request.files["file"]
+    filename = file.filename
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(filepath)
 
-# Route for file uploads (Image Upload)
+    print(f"📸 Reference image received: {filename}")
+
+    # Convert image to Base64 and store in MongoDB
+    with open(filepath, "rb") as img_file:
+        image_data = base64.b64encode(img_file.read()).decode("utf-8")
+
+    result = reference_collection.insert_one({"name": filename, "image": image_data})
+    print(f"✅ Reference image {filename} stored in MongoDB!")
+
+    return jsonify({"message": "Reference image uploaded successfully!", "filename": filename})
+
+
+# ---------------------- Face Matching Endpoint ----------------------
 @app.route("/upload", methods=["POST"])
 def upload_file():
     if "file" not in request.files:
-        return jsonify({"error": "No file uploaded!"})
+        return jsonify({"error": "No file uploaded!"}), 400
 
     file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "No selected file!"})
+    filename = file.filename
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(filepath)
 
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(filepath)
+    print(f"📸 Uploaded image received: {filename}")
 
-        return recognize_face(filepath)
+    # Fetch stored reference images from MongoDB
+    reference_faces = reference_collection.find({}, {"_id": 0, "image": 1, "name": 1})
 
-    return jsonify({"error": "Invalid file format. Allowed: png, jpg, jpeg"})
+    best_match = None
+    for ref_face in reference_faces:
+        ref_name = ref_face["name"]
+        ref_image_data = base64.b64decode(ref_face["image"])
 
-# Route for camera-based face recognition
-@app.route("/camera_recognition", methods=["POST"])
-def camera_recognition():
-    data = request.get_json()
-    if "image" not in data:
-        return jsonify({"error": "No image data received!"})
+        # Convert Base64 to NumPy array and decode
+        ref_np_arr = np.frombuffer(ref_image_data, np.uint8)
+        ref_img = cv2.imdecode(ref_np_arr, cv2.IMREAD_COLOR)
 
-    image_data = data["image"].split(",")[1]  # Remove Base64 prefix
-    image_bytes = base64.b64decode(image_data)
-    image_np = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(image_np, cv2.IMREAD_COLOR)
+        # Save temp reference image
+        ref_image_path = os.path.join(UPLOAD_FOLDER, ref_name)
+        cv2.imwrite(ref_image_path, ref_img)
 
-    # Save the captured image temporarily
-    temp_image_path = os.path.join(UPLOAD_FOLDER, "camera_capture.jpg")
-    cv2.imwrite(temp_image_path, img)
+        # Face detection check before verification
+        try:
+            detected_faces = DeepFace.extract_faces(filepath, detector_backend="mtcnn")
+            if detected_faces is None:
+                print(f"❌ No face detected in uploaded image: {filename}")
+                return jsonify({"error": "No face detected in the image!"}), 400
+        except Exception as e:
+            print(f"❌ Error detecting face in {filename}: {e}")
+            return jsonify({"error": "Face detection failed!"}), 500
 
-    return recognize_face(temp_image_path)
+        # Perform face verification using DeepFace
+        try:
+            print(f"🔍 Comparing {filename} with reference: {ref_name}")
+            result = DeepFace.verify(img1_path=filepath, img2_path=ref_image_path, model_name="Facenet512", distance_metric="cosine", detector_backend="mtcnn")
 
-# Face recognition function
-def recognize_face(image_path):
-    try:
-        result = DeepFace.find(
-            img_path=image_path,
-            db_path=DB_PATH,
-            model_name="Facenet512",
-            distance_metric="cosine",
-            threshold=0.8,
-            detector_backend="mtcnn",
-            enforce_detection=False,
-        )
+            print(f"✅ Face verification result: {result}")
 
-        if isinstance(result, list) and len(result) > 0:
-            df = result[0]
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                file_names = df["identity"].tolist()
-                return jsonify({"success": True, "matches": file_names})
-            else:
-                return jsonify({"success": True, "matches": []})
+            if result["verified"]:
+                best_match = ref_name
+                break  # Stop after finding the first match
+        except Exception as e:
+            print(f"❌ Error comparing with {ref_name}: {e}")
 
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    if best_match:
+        return jsonify({"message": "Match found!", "matched_with": best_match})
+    else:
+        return jsonify({"message": "No match found!"})
+
+
+# ---------------------- Serve Frontend ----------------------
+@app.route("/")
+def serve_frontend():
+    frontend_path = os.path.join(os.getcwd(), "..", "frontend", "index.html")
+    return send_file(frontend_path)
+
 
 if __name__ == "__main__":
     app.run(debug=True)
